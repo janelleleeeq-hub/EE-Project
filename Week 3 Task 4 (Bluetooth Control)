@@ -1,0 +1,191 @@
+#include <SoftwareSerial.h>
+#include <LiquidCrystal.h>
+
+char cmd;   // Command from Bluetooth
+
+// LCD: rs=8, en=9, d4=4, d5, d6, d7
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);           
+// HC05          
+SoftwareSerial BT(12,13); // RX TX
+
+// Motor A (left)
+const int ENA = 3;
+const int IN1 = A1;
+const int IN2 = A2;
+
+// Motor B (right)
+const int ENB = 11;
+const int IN3 = A3;
+const int IN4 = A4;
+
+//Encoder
+const float PULSES_PER_REV    = 20.0;   // <-- change after you measure
+const float WHEEL_DIAMETER_MM = 65.0;   // <-- put your wheel diameter
+const int encoderPinLeft = A5; 
+const int encoderPinRight = 2; 
+
+// ====== VARIABLES ======
+volatile long leftCount = 0;     // updated in ISR, must be volatile(modifier)
+volatile long rightCount = 0; 
+int lastLeftState  = LOW;
+int lastRightState = LOW;
+
+// ======================= Time =======================
+unsigned long startTime = 0;
+
+void setup() {
+  Serial.begin(9600);  // HC-05 default baud rate
+  BT.begin(9600);       // Start HC-05 Bluetooth serial
+
+  lcd.begin(16, 2);
+  lcd.print("Project Car");
+  delay(1000);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Time:");
+  lcd.setCursor(0, 1);
+  lcd.print("Dist:");
+  
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  pinMode(encoderPinLeft, INPUT); 
+  pinMode(encoderPinRight, INPUT);
+  startTime = millis();
+  // Default stop
+  stopMotors();
+}
+
+void loop() {
+  // ---------- 1. Encoder counting (polling, edge detect) ----------
+  int stateLeft  = digitalRead(encoderPinLeft);
+  int stateRight = digitalRead(encoderPinRight);
+
+  // Count rising edges
+  if (stateLeft == HIGH && lastLeftState == LOW) {
+    leftCount++;
+  }
+  if (stateRight == HIGH && lastRightState == LOW) {
+    rightCount++;
+  }
+
+  lastLeftState  = stateLeft;
+  lastRightState = stateRight;
+  
+  unsigned long currentTime = millis() - startTime;
+  lcd.setCursor(6, 0);
+  lcd.print("     ");
+  lcd.setCursor(6, 0);
+  lcd.print(currentTime / 1000);
+  lcd.print("s");
+  
+  // Read from Bluetooth module
+  if (BT.available()) {
+    cmd = BT.read();
+    Serial.println(cmd);  // echo back for debugging
+
+    switch (cmd) {
+      case 'F':  // Joystick up
+        driveForward();
+        break;
+
+      case 'B':  // Joystick down
+        driveBackward();
+        break;
+
+      case 'L':  // Joystick left
+        pivotLeftSearch();
+        break;
+
+      case 'R':  // Joystick right
+        pivotRightSearch();
+        break;
+
+      case 'S':  // Joystick center / stop
+        stopMotors();
+        break;
+
+      default:
+        // Unknown command – you can choose to stop or ignore
+        stopMotors();
+        break;
+    }
+  }
+  // ---------- 4. Compute distance & update LCD ----------
+  // Wheel circumference (mm)
+  float C = 3.14159 * WHEEL_DIAMETER_MM;
+
+  // Revolutions for each wheel
+  float revLeft  = (float)leftCount  / PULSES_PER_REV;
+  float revRight = (float)rightCount / PULSES_PER_REV;
+
+  // Distance for each wheel (mm)
+  float distLeftMM  = revLeft  * C;
+  float distRightMM = revRight * C;
+
+  // TOTAL distance travelled by robot (mm)
+  float totalDistMM = (distLeftMM + distRightMM) / 2.0;
+  float totalDistCM = totalDistMM / 10.0;
+
+  lcd.setCursor(5, 1);
+  lcd.print("       ");      // clear area
+  lcd.setCursor(5, 1);
+  lcd.print(totalDistCM);
+  lcd.print("cm");
+}
+
+// ===== Movement Functions =====
+void driveForward() {
+  // forward for your wiring
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, 100);
+  analogWrite(ENB, 100);
+}
+
+void driveBackward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 100);
+  analogWrite(ENB, 100);
+}
+
+void pivotLeftSearch() {
+  // Pivot left: left backward, right forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, 100);
+  analogWrite(ENB, 100);
+}
+
+void pivotRightSearch() {
+  // Pivot right: left forward, right backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 100);
+  analogWrite(ENB, 100);
+}
+
+void stopMotors() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
