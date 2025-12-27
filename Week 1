@@ -1,0 +1,101 @@
+#include <LiquidCrystal.h>
+#include <stdbool.h>
+#define key A0
+
+//assign Arduino pins for L298N motor driver
+int IN1 = A5;    
+int IN2 = A4;
+int IN3 = A3;
+int IN4 = A2;
+int ENA = 3;     //enable Motor A
+int ENB = 11;    //enable Motor B
+
+//assign speed values
+int speedValue = 150;
+int lastSpeed = 0; //
+//Time variables for future comparison
+unsigned long previousTime=0;    //last recorded time
+unsigned long interval=10000;    //time interval of 10 seconds
+unsigned long lastButtonTime = 0;     //last time button is presses
+const unsigned long debounceTime = 200;   //ignore any button presses 200ms after a press is detected
+bool runcar = true;
+LiquidCrystal lcd(8,9,4,5,6,7);
+
+void setup() {
+  lcd.begin(16, 2);        //initialize LCD size (16 columns, 2 rows)
+  lcd.print("Project Car");
+  delay(1000);             //text stays on screen for 1 second
+  lcd.setCursor(0,0);      //next text will start printing at 0 columns 0 rows
+  lcd.print("                ");     // clear old line
+  lcd.setCursor(0,0);
+  lcd.print("Time:");       //display time at 0 columns 0 rows
+  lcd.setCursor(0, 1);      
+  lcd.print("Speed:");      //display speed at 0 columns 1 rows
+  pinMode(IN1,OUTPUT);      //set L298N input pins as output
+  pinMode(IN2,OUTPUT);
+  pinMode(IN3,OUTPUT);
+  pinMode(IN4,OUTPUT);
+  pinMode(ENA,OUTPUT);      //set L298N enable pins as output
+  pinMode(ENB,OUTPUT);
+  previousTime=millis();
+}
+
+void loop() {
+  unsigned long currentTime = millis() - previousTime;     //calculate current time
+  lcd.setCursor(6, 0);
+  lcd.print(currentTime/1000);      // convert time from ms to s
+  lcd.print("s");
+  int keyvalue = analogRead(key);   // read voltage from analogue pin to identify which button is being pressed (UP/DOWN)
+  if (currentTime - lastButtonTime > debounceTime) {     // ignore repeated presses
+    // adjust motor speed
+    // UP button 
+    if (keyvalue < 250 && keyvalue > 50) {    //detect whether UP button is being pressed
+      speedValue += 10;     //increase speed by 10PWM
+    }
+    if (speedValue > 255) {
+      speedValue = 255;                // prevent speed value from going above 255 PWM (maximum value)
+      lastButtonTime = currentTime;    // reset debouncer timer
+    }
+  
+    // DOWN button
+    if (keyvalue < 450 && keyvalue > 250) {   //detect whether DOWN button is being pressed
+      speedValue -= 10;                //decrease speed by 10 PWM
+    }    
+    if (speedValue < 0) {              
+      speedValue = 0;                     // prevent speed value from going below 0 PWM (minimum value)
+      lastButtonTime = currentTime;       // reset debouncer timer
+    }
+  }
+
+  // update speed value on LCD
+  if (speedValue != lastSpeed) {
+    lcd.setCursor(7, 1);
+    lcd.print("    ");       // clear previous speed value
+    lcd.setCursor(7, 1);
+    lcd.print(speedValue);
+    lastSpeed = speedValue;  // save current value
+  }
+  analogWrite(ENA, speedValue+8);   //increase Motor A (left side) by 8 PWM
+  analogWrite(ENB, speedValue);
+
+  if (currentTime >=interval) {  
+    stop();               //stop vehicle from moving after 10 sec
+  }
+  else {
+    running();
+    }
+}
+
+void running(){
+  digitalWrite(IN1,HIGH);
+  digitalWrite(IN2,LOW);
+  digitalWrite(IN3,HIGH);
+  digitalWrite(IN4,LOW);
+}
+
+ void stop() {
+  digitalWrite(IN1,HIGH);
+  digitalWrite(IN2,HIGH);
+  digitalWrite(IN3,HIGH);
+  digitalWrite(IN4,HIGH);
+ }
