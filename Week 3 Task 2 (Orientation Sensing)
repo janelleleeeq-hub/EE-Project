@@ -1,0 +1,262 @@
+#include <Wire.h>         //I2C communication library
+#include <LiquidCrystal.h>
+
+// --- Pins ---
+#define MOTOR_A_EN 3    // Left Motor Speed (PWM)
+#define MOTOR_A_IN1 A1
+#define MOTOR_A_IN2 A2
+#define MOTOR_B_EN 11   // Right Motor Speed (PWM)
+#define MOTOR_B_IN1 12
+#define MOTOR_B_IN2 13
+
+// --- LCD ---
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+
+// --- Settings ---
+int baseSpeed = 255;             // Default motor speed 
+const int DESCEND_SPEED = 150;   // Speed when descending ramp
+const int RAMP_THRESHOLD = 7;    // Pitch angle to detect ramp
+const int FLAT_THRESHOLD = 4;    // Pitch angle to detect flat surface
+
+// --- IMU Variables ---
+const int MPU = 0x68;          // I2C address 
+float AccX, AccY, AccZ;        // Accelerometer readings 
+float GyroX, GyroY, GyroZ;     // Gyroscope readings 
+float accAngleY;               // Pitch angle from accelerometer
+float pitch = 0.0;             // Filtered pitch angle
+float yaw = 0.0;               // Integrated yaw angle
+float GyroErrorY, GyroErrorZ;  // Gyroscope bias errors
+float elapsedTime, currentTime, previousTime;   // Time tracking
+float PitchOffset = 0.0;       // Initial pitch offset (calibration)
+
+// --- State Machine ---
+int robotState = 0;             // 0: climbing, 1: wait on top, 2: spin, 3: done
+unsigned long stateTimer = 0;   // Timer for state transitions
+double maxPitchReached = 0.0;   // Maximum pitch recorded
+
+// --- Ramp Detection ---
+bool onRampConfirmed = false;
+unsigned long rampTimer = 0;
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();                // Initialize I2C bus
+
+  // Wake up MPU
+  Wire.beginTransmission(MPU);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+
+  lcd.begin(16, 2);
+  lcd.print("Calibrating...");  // Startup message
+
+  pinMode(MOTOR_A_EN, OUTPUT);
+  pinMode(MOTOR_A_IN1, OUTPUT);
+  pinMode(MOTOR_A_IN2, OUTPUT);
+  pinMode(MOTOR_B_EN, OUTPUT);
+  pinMode(MOTOR_B_IN1, OUTPUT);
+  pinMode(MOTOR_B_IN2, OUTPUT);
+
+  stopMotors();
+  calculate_IMU_error();        // Measure gyro bias error
+  delay(200);
+  // Calculate and store pitch offset ---
+  readIMU();
+  accAngleY = atan(-AccX / sqrt(pow(AccY, 2) + pow(AccZ, 2))) * 180 / PI;
+  PitchOffset = accAngleY;       // Use the raw stable angle as the offset
+  
+  delay(500);
+  lcd.clear();
+  lcd.print("Go! Speed: 255");   // Start message
+  delay(1000);
+  lcd.clear();
+  currentTime = millis();    // Initialize timing
+}
+
+void loop() {
+  previousTime = currentTime;
+  currentTime = millis();
+  elapsedTime = (currentTime - previousTime) / 1000.0;
+
+  readIMU();                      // Read accelerometer and gyroscope
+
+  // Calculate pitch angle from accelerometer (in degrees)
+  accAngleY = atan(-AccX / sqrt(pow(AccY, 2) + pow(AccZ, 2))) * 180 / PI;   
+
+  // Complementary filter:
+  pitch = 0.96* (pitch + GyroY * elapsedTime) + 0.04 * (accAngleY - PitchOffset);  
+  
+  yaw += GyroZ * elapsedTime;      //Rotation of an object around its vertical axis, z
+
+  if (pitch > maxPitchReached){     // Track max pitch
+  maxPitchReached = pitch;
+  }
+
+  // LCD update
+  static unsigned long lastLCD = 0;  
+  if (millis() - lastLCD > 200) {         // Update LCD every 200 ms
+    lcd.setCursor(0, 0);
+    lcd.print("Pitch: "); 
+    lcd.print(abs(pitch), 1);             // Display pitch angle
+    lcd.setCursor(0, 1);
+    lcd.print("Max: "); 
+    lcd.print(abs(maxPitchReached), 1);   // Display max pitch
+    lastLCD = millis();
+  }
+
+  // --- STATE MACHINE ---
+  if (robotState == 0) {              // climbing ramp
+    setMotorSpeed('A', baseSpeed);
+    setMotorSpeed('B', baseSpeed);
+
+    // Ramp detection
+    if (pitch > RAMP_THRESHOLD) {
+      if (rampTimer == 0) {
+      rampTimer = millis();           // Start ramp timer
+      }
+      else if (millis() - rampTimer > 300) {
+      onRampConfirmed = true;         //on ramp more tham 300ms
+      }
+    } 
+    else rampTimer = 0;               // Reset
+    // Top reached
+    if (onRampConfirmed && pitch < FLAT_THRESHOLD) {
+      robotState = 1;
+      stateTimer = millis();
+      stopMotors();
+    }
+  }
+  else if (robotState == 1) {        // wait at top
+    if (millis() - stateTimer > 4000) {
+      robotState = 2;                // Transition to SPIN
+      lcd.clear();
+      lcd.print("SPINNING 360");
+      stateTimer = yaw;              // save starting yaw
+    }
+  }
+  else if (robotState == 2) {       // spin 360
+    if (abs(yaw - (float)stateTimer) < 345.0) {
+  setMotorSpeed('A', 150);
+  setMotorSpeed('B', -150);
+}
+else { 
+  robotState = 3;                   // Move to DESCEND
+  stopMotors(); 
+    }
+  }
+  else if (robotState == 3) {      // DESCEND RAMP
+    setMotorSpeed('A', DESCEND_SPEED);
+    setMotorSpeed('B', DESCEND_SPEED);
+    
+    // Check for flat ground 
+    if (pitch < 2.0) { 
+      if (pitch > -2.0) {         // -2.0 to 2.0 indicates flat ground reached
+      delay(500); 
+      robotState = 4;             // Done
+      stopMotors();
+      lcd.clear();
+      lcd.print("DONE!");
+    }
+    }
+  }
+  else if (robotState == 4) {     // FINAL STOP
+    stopMotors();
+  }
+}
+
+// --- MOTOR CONTROL ---
+void setMotorSpeed(char motor, int speed) {
+  int enPin, in1Pin, in2Pin;
+
+  if (motor == 'A') {          // LEFT motor 
+    enPin = MOTOR_A_EN;
+    in1Pin = MOTOR_A_IN1;
+    in2Pin = MOTOR_A_IN2;
+
+    if (speed >= 0) {          // Forward
+      digitalWrite(in1Pin, LOW);
+      digitalWrite(in2Pin, HIGH);
+    } else {                   // Backward
+      digitalWrite(in1Pin, HIGH);
+      digitalWrite(in2Pin, LOW);
+      speed = -speed;           // make speed positive for analogWrite
+    }
+  } 
+  else if (motor == 'B') {      // RIGHT motor
+    enPin = MOTOR_B_EN;
+    in1Pin = MOTOR_B_IN1;
+    in2Pin = MOTOR_B_IN2;
+
+    if (speed >= 0) {           // Forward
+      digitalWrite(in1Pin, HIGH);
+      digitalWrite(in2Pin, LOW);
+    } else {                    // Backward
+      digitalWrite(in1Pin, LOW);
+      digitalWrite(in2Pin, HIGH);
+      speed = -speed;            // make speed positive for analogWrite
+    }
+  } 
+  else return;
+  analogWrite(enPin, speed);     // Apply PWM speed
+}
+
+void stopMotors() {
+  digitalWrite(MOTOR_A_IN1, LOW);
+  digitalWrite(MOTOR_A_IN2, LOW);
+  digitalWrite(MOTOR_B_IN1, LOW);
+  digitalWrite(MOTOR_B_IN2, LOW);
+  analogWrite(MOTOR_A_EN, 0);
+  analogWrite(MOTOR_B_EN, 0);
+}
+
+// --- IMU FUNCTIONS ---
+void readIMU() {
+  Wire.beginTransmission(MPU);        // Start I2C communication 
+  Wire.write(0x3B);                   // Start from ACCEL_XOUT_H register
+  Wire.endTransmission(false);        // End write phase, keep I2C bus active 
+  Wire.requestFrom(MPU, 14, true);    //Requests 14 bytes of data 
+
+  // Combine high and low bytes to form 16-bit signed values
+  // Divide by 16384 to convert raw value to acceleration in g
+  AccX = (Wire.read() << 8 | Wire.read()) / 16384.0;    
+  AccY = (Wire.read() << 8 | Wire.read()) / 16384.0;   
+  AccZ = (Wire.read() << 8 | Wire.read()) / 16384.0;    
+
+  Wire.read(); 
+  Wire.read();       // skip temp
+
+  // Combine high and low bytes to form 16-bit signed values
+  // Convert to degrees per second
+  GyroX = (Wire.read() << 8 | Wire.read()) / 131.0; 
+  GyroY = (Wire.read() << 8 | Wire.read()) / 131.0;
+  GyroZ = (Wire.read() << 8 | Wire.read()) / 131.0;
+  
+  //remove bias error
+  GyroY -= GyroErrorY;
+  GyroZ -= GyroErrorZ; 
+}
+
+// Calculates gyroscope bias by averaging multiple readings while the sensor is stationary
+void calculate_IMU_error() { 
+  int i = 0;                        // Loop counter
+
+  while (i < 200) {                 // Take 200 samples
+    Wire.beginTransmission(MPU);
+    Wire.write(0x43); //GYRO_XOUT_H
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU, 6, true);    // Request 6 bytes: Gyro X, Y, Z
+
+    GyroY = (Wire.read() << 8 | Wire.read()) / 131.0;  
+    GyroZ = (Wire.read() << 8 | Wire.read()) / 131.0;
+
+    // Accumulate gyroscope readings
+    GyroErrorY += GyroY;
+    GyroErrorZ += GyroZ;
+    i++;
+  }
+  // Compute average bias error
+  GyroErrorY /= 200;
+  GyroErrorZ /= 200;
+  //This value is later subtracted from gyro readings so the robot knows the true angular velocity.
+}
