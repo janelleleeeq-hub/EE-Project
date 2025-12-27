@@ -1,0 +1,309 @@
+#include <LiquidCrystal.h>
+
+// LCD: rs=8, en=9, d4=4, d5, d6, d7
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+
+// Motor A (left)
+const int ENA = 3;
+const int IN1 = A5;
+const int IN2 = A4;
+
+// Motor B (right)
+const int ENB = 11;
+const int IN3 = A3;
+const int IN4 = 2;
+
+// IR Sensors (analog) – OUTSIDE the line
+const int IRSensorLeftAnalog  = A2;   // left sensor
+const int IRSensorRightAnalog = A1;   // right sensor
+
+// Time
+unsigned long previousTime = 0;
+
+// Speed
+const int baseSpeed = 130;
+const int maxSpeed  = 180;
+
+// PID gain
+float Kp = 0.15;
+float Ki = 0.0;
+float Kd = 0.08;
+
+int lastError = 0;
+long integral  = 0;
+
+// THRESHOLDS
+const int lineThreshold  = 350;    // <350 = black, >350 = white
+const int finishHoldTime = 80;     // ms to confirm finish
+
+// Finish detection state
+bool finishCandidate = false;
+unsigned long finishStartTime = 0;
+
+//Encoder
+const float PULSES_PER_REV    = 20.0;    // Number of encoder pulses per full wheel rotation
+const float WHEEL_DIAMETER_MM = 65.0;    //used to calculate distance
+
+// Arduino pins connected
+const int encoderPinLeft = 12; 
+const int encoderPinRight = 13; 
+
+// ====== VARIABLES ======
+// updated in ISR, must be volatile (variables are updated inside an ISR)
+volatile long leftCount = 0;     // Left wheel pulse counter
+volatile long rightCount = 0;    // Right wheel pulse counter
+
+byte lastState;   //8-bit unsigned integer
+                  // Used to store previous readings of encoder signals
+
+// State tracking for corner detection
+// 0 = white/center, 1 = left edge, 2 = right edge, 3 = both black
+byte lstate = 0;
+
+void setup() {
+  lcd.begin(16, 2);
+  lcd.print("Project Car");
+  delay(1000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Time:");
+  previousTime = millis();
+  lcd.setCursor(0, 1);
+  lcd.print("Dist:");
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  pinMode(IRSensorLeftAnalog, INPUT);
+  pinMode(IRSensorRightAnalog, INPUT);
+
+  pinMode(encoderPinLeft, INPUT); 
+  pinMode(encoderPinRight, INPUT); 
+
+  // Enable PCINT group 0 (D8–D13)
+  PCICR  |= (1 << PCIE0);
+  // Enable interrupts on D12 (PCINT4) and D13 (PCINT5)
+  PCMSK0 |= (1 << PCINT4);
+  PCMSK0 |= (1 << PCINT5);
+  // Read initial state
+  lastState = PINB;  // PINB contains D8-D13
+  
+  Serial.begin(9600);
+}
+
+void stopMotors() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+void driveForward(int leftSpeed, int rightSpeed) {
+  // forward for your wiring
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, leftSpeed);
+  analogWrite(ENB, rightSpeed);
+}
+void pivotLeftSearch() {
+  // Small push forward so front gets past the corner
+  driveForward(60, 60);
+  delay(80);
+
+  // Pivot left: left backward, right forward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, 120);
+  analogWrite(ENB, 120);
+
+  // Spin until one sensor finds the line again
+  while (true) {
+    int LA = analogRead(IRSensorLeftAnalog);
+    int RA = analogRead(IRSensorRightAnalog);
+    if (LA < lineThreshold || RA < lineThreshold) break;
+    delay(8);
+  }
+}
+void pivotRightSearch() {
+  // Small push forward so front gets past the corner
+  driveForward(60, 60);
+  delay(80);
+
+  // Pivot right: left forward, right backward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, 120);
+  analogWrite(ENB, 120);
+
+  // Spin until one sensor finds the line again
+  while (true) {
+    int LA = analogRead(IRSensorLeftAnalog);
+    int RA = analogRead(IRSensorRightAnalog);
+    if (LA < lineThreshold || RA < lineThreshold) break;
+    delay(8);
+  }
+}
+
+void loop() {
+   // ---- Read sensors ----
+  int LA = analogRead(IRSensorLeftAnalog);
+  int RA = analogRead(IRSensorRightAnalog);
+  
+  bool leftOnLine  = (LA < lineThreshold);
+  bool rightOnLine = (RA < lineThreshold);
+  
+  // Determine current state
+  byte currentState;
+  if (leftOnLine && rightOnLine) {
+    currentState = 3;              // both black
+  } else if (leftOnLine && !rightOnLine) {
+    currentState = 1;              // left edge
+  } else if (!leftOnLine && rightOnLine) {
+    currentState = 2;              // right edge
+  } else {
+    currentState = 0;              // both white / center
+  }
+  
+  // ---- Timer display ----
+  unsigned long currentTime = millis() - previousTime;
+  lcd.setCursor(6, 0);
+  lcd.print("     ");
+  lcd.setCursor(6, 0);
+  lcd.print(currentTime / 1000);
+  lcd.print("s");
+
+  Serial.print("LA: ");
+  Serial.print(LA);
+  Serial.print("  RA: ");
+  Serial.println(RA);
+
+  // ==============================
+  // 1) FINISH DETECTION (both black)
+  // ==============================
+  if (currentState == 3) {
+//     both on black
+    if (!finishCandidate) {
+      finishCandidate = true;
+      finishStartTime = millis();
+    } else {
+      if (millis() - finishStartTime > finishHoldTime) {
+        // stayed both-black long enough → finish
+        stopMotors();
+        while (1) {
+        }
+      }
+    }
+  } else {
+    // not both black anymore → cancel finish candidate
+    finishCandidate = false;
+  }
+
+   // 2) CORNER RECOVERY:
+  //    If we JUST came from an edge, and now both white,
+  //    assume 90° corner and search by pivot.
+  // ==============================
+  if (currentState == 0 && (lstate == 1 || lstate == 2)) {
+    // Just went from edge -> white-white
+    if (lstate == 1) {
+      // Left edge before → left corner
+      pivotLeftSearch();
+    } else if (lstate == 2) {
+      // Right edge before → right corner
+      pivotRightSearch();
+    }
+    // After search, update state and skip PID this loop
+    lstate = 0;
+    return;
+  }
+
+  // ==============================
+  // 2) NORMAL PID LINE FOLLOWING
+  // ==============================
+
+  // For outer sensors:
+  // error > 0 → RA > LA → left side darker → line on LEFT → turn LEFT
+  // error < 0 → RA < LA → right side darker → line on RIGHT → turn RIGHT
+  int error = RA - LA;
+
+  integral += error;
+  int derivative = error - lastError;
+  lastError = error;
+
+  float correction = Kp * error + Ki * integral + Kd * derivative;
+
+  int leftSpeed  = baseSpeed - correction;
+  int rightSpeed = baseSpeed + correction;
+
+  // clamp speeds
+  if (leftSpeed < 0)        leftSpeed = 0;
+  if (leftSpeed > maxSpeed) leftSpeed = maxSpeed;
+  if (rightSpeed < 0)       rightSpeed = 0;
+  if (rightSpeed > maxSpeed)rightSpeed = maxSpeed;
+
+  // drive forward with PID-adjusted speeds
+  driveForward(leftSpeed, rightSpeed);
+  lstate = currentState;
+  
+  delay(15);
+
+  //encoder
+  // --- Safely copy counts ---
+  noInterrupts();    // disable all interrupts temporarily
+  long L = leftCount;
+  long R = rightCount;
+  interrupts();      // enable interrupts again
+
+  // Wheel circumference (mm)
+  float C = 3.14159 * WHEEL_DIAMETER_MM;
+
+  // Revolutions for each wheel
+  float revLeft  = L / PULSES_PER_REV;
+  float revRight = R / PULSES_PER_REV;
+
+  // Distance for each wheel (mm)
+  float distLeftMM  = revLeft  * C;
+  float distRightMM = revRight * C;
+
+  // TOTAL distance travelled by robot (mm)
+  float totalDistMM = (distLeftMM + distRightMM) / 2.0;
+  float totalDistCM = totalDistMM / 10.0;
+  lcd.setCursor(5, 1);
+  lcd.print(totalDistCM);
+  lcd.print("cm");
+
+}
+
+// ====== PCINT ISR ======
+ISR(PCINT0_vect) {
+  byte current = PINB;  // read current states
+
+  // Check pin 12 (bit 4)
+  if ( (current & (1 << 4)) && !(lastState & (1 << 4)) ) {
+    leftCount++;      // rising edge
+  }
+
+  // Check pin 13 (bit 5)
+  if ( (current & (1 << 5)) && !(lastState & (1 << 5)) ) {
+    rightCount++;     // rising edge
+  }
+
+  lastState = current; // save previous state
+}
